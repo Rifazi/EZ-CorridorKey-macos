@@ -1430,7 +1430,6 @@ class CorridorKeyService:
         fps = 24.0
         if input_asset.asset_type == 'video':
             try:
-                import cv2
                 cap = cv2.VideoCapture(input_asset.path)
                 if cap.isOpened():
                     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -1442,8 +1441,6 @@ class CorridorKeyService:
             asset_type='image_sequence',
             path=alpha_dir,
             frame_count=total_frames,
-            width=frames[0].shape[1] if frames else 0,
-            height=frames[0].shape[0] if frames else 0,
         )
         # Add fps attribute to the alpha_asset if needed
         alpha_asset.fps = fps

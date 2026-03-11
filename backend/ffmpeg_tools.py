@@ -913,10 +913,7 @@ def build_exr_vf(video_info: dict) -> str:
         pix_fmt, cs, cp, ct, cr,
     )
 
-    return (
-        f"scale=in_color_matrix={cs}:in_primaries={cp}:"
-        f"in_transfer={ct}:in_range={cr},format=gbrpf32le"
-    )
+    return "scale,format=gbrpf32le"
 
 
 def extract_frames(
