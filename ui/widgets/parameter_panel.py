@@ -1,4 +1,10 @@
-"""Right panel — alpha generation, tracking, and output config."""
+"""Right panel — alpha generation, inference parameters, and output config.
+
+Sections follow the pipeline order:
+1. Alpha Generation — GVM Auto (automatic) or VideoMaMa (manual masks)
+2. Inference — Color Space, Despill, Despeckle, Refiner, Live Preview
+3. Output — FG/Matte/Comp/Processed format selectors
+"""
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
@@ -17,7 +23,8 @@ class ParameterPanel(QWidget):
     params_changed = Signal()  # emitted when any parameter changes
     gvm_requested = Signal()      # GVM AUTO button clicked
     videomama_requested = Signal() # VIDEOMAMA button clicked
-    track_masks_requested = Signal()  # Track annotation prompts into dense masks
+    rembg_requested = Signal()     # Rembg button clicked
+    export_masks_requested = Signal()  # Export annotation masks clicked
     import_alpha_requested = Signal()  # Import own AlphaHint folder
 
     def __init__(self, parent=None):
@@ -70,22 +77,40 @@ class ParameterPanel(QWidget):
         self._videomama_btn = QPushButton("VIDEOMAMA")
         self._videomama_btn.setEnabled(False)
         self._videomama_btn.setToolTip(
-            "Generate alpha hints from a dense VideoMaMa mask track.\n\n"
-            "1. Paint sparse foreground/background prompts\n"
-            "2. Click Track Mask to generate dense masks with SAM2\n"
-            "3. Click VIDEOMAMA to generate AlphaHint"
+            "Generate alpha from painted annotations via VideoMaMa.\n\n"
+            "1. Paint masks on frames with hotkey 1 (green/foreground)\n"
+            "   or 2 (red/background)\n"
+            "2. Click Export Masks to save annotations\n"
+            "3. Click VIDEOMAMA to generate alpha\n\n"
+            "Tip: Annotate keyframes where the subject changes shape\n"
+            "or overlaps complex backgrounds — more frames = better results."
         )
         self._videomama_btn.clicked.connect(self.videomama_requested.emit)
         alpha_layout.addWidget(self._videomama_btn)
 
-        self._track_masks_btn = QPushButton("TRACK MASK")
-        self._track_masks_btn.setEnabled(False)
-        self._track_masks_btn.setToolTip(
-            "Use SAM2 to turn painted prompts into a dense VideoMaMa mask track.\n"
-            "This is the required step before running VideoMaMa from annotations."
+        or_label_rembg = QLabel("— or —")
+        or_label_rembg.setAlignment(Qt.AlignCenter)
+        or_label_rembg.setStyleSheet("color: #808070; font-size: 11px;")
+        alpha_layout.addWidget(or_label_rembg)
+
+        self._rembg_btn = QPushButton("REMBG")
+        self._rembg_btn.setEnabled(False)
+        self._rembg_btn.setToolTip(
+            "Fast background removal using rembg AI.\n"
+            "Best for green screen footage.\n"
+            "Much faster than GVM on Mac, good quality results."
         )
-        self._track_masks_btn.clicked.connect(self.track_masks_requested.emit)
-        alpha_layout.addWidget(self._track_masks_btn)
+        self._rembg_btn.clicked.connect(self.rembg_requested.emit)
+        alpha_layout.addWidget(self._rembg_btn)
+
+        self._export_masks_btn = QPushButton("EXPORT MASKS")
+        self._export_masks_btn.setEnabled(False)
+        self._export_masks_btn.setToolTip(
+            "Export painted annotations as VideoMamaMaskHint.\n"
+            "Then click VIDEOMAMA to generate alpha from your masks."
+        )
+        self._export_masks_btn.clicked.connect(self.export_masks_requested.emit)
+        alpha_layout.addWidget(self._export_masks_btn)
 
         self._annotation_info = QLabel("")
         self._annotation_info.setStyleSheet("color: #808070; font-size: 10px;")
@@ -329,9 +354,6 @@ class ParameterPanel(QWidget):
 
     def get_output_config(self) -> OutputConfig:
         """Snapshot current output format configuration."""
-        from ui.widgets.preferences_dialog import (
-            KEY_EXR_COMPRESSION, DEFAULT_EXR_COMPRESSION, get_setting_str,
-        )
         return OutputConfig(
             fg_enabled=self._fg_check.isChecked(),
             fg_format=self._fg_format.currentText(),
@@ -341,7 +363,6 @@ class ParameterPanel(QWidget):
             comp_format=self._comp_format.currentText(),
             processed_enabled=self._proc_check.isChecked(),
             processed_format=self._proc_format.currentText(),
-            exr_compression=get_setting_str(KEY_EXR_COMPRESSION, DEFAULT_EXR_COMPRESSION),
         )
 
     def set_params(self, params: InferenceParams) -> None:
@@ -383,6 +404,10 @@ class ParameterPanel(QWidget):
         """Enable/disable VideoMaMa button based on clip state."""
         self._videomama_btn.setEnabled(enabled)
 
+    def set_rembg_enabled(self, enabled: bool) -> None:
+        """Enable/disable Rembg button based on clip state."""
+        self._rembg_btn.setEnabled(enabled)
+
     def set_import_alpha_enabled(self, enabled: bool) -> None:
         """Enable/disable Import Alpha button based on clip state."""
         self._import_alpha_btn.setEnabled(enabled)
@@ -391,7 +416,7 @@ class ParameterPanel(QWidget):
         """Update annotation frame counter."""
         if annotated > 0 and total > 0:
             self._annotation_info.setText(f"Annotated: {annotated} / {total} frames")
-            self._track_masks_btn.setEnabled(True)
+            self._export_masks_btn.setEnabled(True)
         else:
             self._annotation_info.setText("")
-            self._track_masks_btn.setEnabled(False)
+            self._export_masks_btn.setEnabled(False)

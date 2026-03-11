@@ -2,7 +2,7 @@
 # Corridor Key Launcher - Local Linux/macOS
 
 # Get the directory where this script is located
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+SCRIPT_DIR="$( cd "$( dirname "$0" )" &> /dev/null && pwd )"
 LOCAL_PYTHON="python3"
 LOCAL_SCRIPT="$SCRIPT_DIR/clip_manager.py"
 

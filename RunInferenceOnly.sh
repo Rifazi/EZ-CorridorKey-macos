@@ -4,7 +4,7 @@
 set -e
 
 # Path to script directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Activate Environment
 source "${SCRIPT_DIR}/venv/bin/activate"

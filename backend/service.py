@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
 import glob as glob_module
 import logging
@@ -35,15 +34,11 @@ from .clip_state import (
     ClipAsset,
     ClipEntry,
     ClipState,
-    MASK_TRACK_MANIFEST,
-    mask_sequence_is_videomama_ready,
     scan_clips_dir,
 )
-from .annotation_prompts import load_annotation_prompt_frames
 from .errors import (
     CorridorKeyError,
     FrameReadError,
-    GPURequiredError,
     WriteFailureError,
     JobCancelledError,
 )
@@ -54,7 +49,7 @@ from .validators import (
     ensure_output_dirs,
 )
 from .frame_io import (
-    write_exr,
+    write_exr_dwab,
     read_image_frame,
     read_mask_frame,
     read_video_frame_at,
@@ -62,6 +57,7 @@ from .frame_io import (
     read_video_mask_at,
 )
 from .job_queue import GPUJob, GPUJobQueue
+from .tile_motion import MotionConfig, MotionPlan, build_motion_plan, crop_roi, paste_core
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +72,6 @@ class _ActiveModel(Enum):
     NONE = "none"
     INFERENCE = "inference"
     GVM = "gvm"
-    SAM2 = "sam2"
     VIDEOMAMA = "videomama"
 
 
@@ -111,7 +106,6 @@ class OutputConfig:
     comp_format: str = "png"
     processed_enabled: bool = True
     processed_format: str = "exr"
-    exr_compression: str = "dwab"  # "dwab", "piz", "zip", or "none"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -205,12 +199,10 @@ class CorridorKeyService:
     def __init__(self):
         self._engine = None
         self._gvm_processor = None
-        self._sam2_tracker = None
         self._videomama_pipeline = None
         self._active_model = _ActiveModel.NONE
         self._device: str = 'cpu'
         self._job_queue: Optional[GPUJobQueue] = None
-        self._sam2_model_id: str = "facebook/sam2.1-hiera-base-plus"
         # GPU mutex — serializes ALL model operations (Codex: thread safety)
         self._gpu_lock = threading.Lock()
 
@@ -220,29 +212,6 @@ class CorridorKeyService:
         if self._job_queue is None:
             self._job_queue = GPUJobQueue()
         return self._job_queue
-
-    @property
-    def sam2_model_id(self) -> str:
-        """Current SAM2 checkpoint preference."""
-        return self._sam2_model_id
-
-    def set_sam2_model(self, model_id: str) -> None:
-        """Update the SAM2 checkpoint used for future tracking jobs."""
-        if not model_id or model_id == self._sam2_model_id:
-            return
-        logger.info("SAM2 model preference changed: %s -> %s", self._sam2_model_id, model_id)
-        self._sam2_model_id = model_id
-        if self._sam2_tracker is not None:
-            self._safe_offload(self._sam2_tracker)
-            self._sam2_tracker = None
-            if self._active_model == _ActiveModel.SAM2:
-                self._active_model = _ActiveModel.NONE
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                logger.debug("CUDA cache clear skipped after SAM2 model switch", exc_info=True)
 
     # --- Device & Engine Management ---
 
@@ -356,9 +325,6 @@ class CorridorKeyService:
                         except Exception:
                             pass
                     del gvm
-            elif self._active_model == _ActiveModel.SAM2:
-                self._safe_offload(self._sam2_tracker)
-                self._sam2_tracker = None
             elif self._active_model == _ActiveModel.VIDEOMAMA:
                 self._safe_offload(self._videomama_pipeline)
                 self._videomama_pipeline = None
@@ -433,10 +399,16 @@ class CorridorKeyService:
         if on_status:
             on_status("Initializing inference engine...")
         logger.info("Constructing CorridorKeyEngine...")
+        
+        # MPS (Apple Silicon) benefits from smaller input size to avoid memory thrashing
+        # 768 is a good balance: small enough for tiles, large enough for quality on full frames
+        img_size = 768 if self._device == 'mps' else 2048
+        logger.info(f"Using img_size={img_size} for device: {self._device}")
+        
         self._engine = CorridorKeyEngine(
             checkpoint_path=ckpt_path,
             device=self._device,
-            img_size=2048,
+            img_size=img_size,
             optimization_mode=os.environ.get('CORRIDORKEY_OPT_MODE', 'auto'),
             on_status=on_status,
         )
@@ -458,37 +430,6 @@ class CorridorKeyService:
         logger.info(f"GVM loaded in {time.monotonic() - t0:.1f}s")
         return self._gvm_processor
 
-    def _get_sam2_tracker(
-        self,
-        *,
-        on_progress: Callable[[int, int], None] | None = None,
-        on_status: Callable[[str], None] | None = None,
-    ):
-        """Lazy-load the optional SAM2 tracker."""
-        self._ensure_model(_ActiveModel.SAM2)
-
-        if self._sam2_tracker is not None:
-            return self._sam2_tracker
-
-        from sam2_tracker import SAM2Tracker
-
-        logger.info("Loading SAM2 tracker...")
-        t0 = time.monotonic()
-        self._sam2_tracker = SAM2Tracker(
-            model_id=self._sam2_model_id,
-            device=self._device,
-            # Meta's VOS path aggressively torch.compiles multiple components.
-            # That is a poor default for this GUI app on Windows: it can spawn
-            # compiler subprocesses, freeze the desktop, and hide progress.
-            vos_optimized=False,
-            offload_video_to_cpu=self._device.startswith("cuda"),
-            offload_state_to_cpu=False,
-        )
-        if self._sam2_tracker is not None:
-            self._sam2_tracker.prepare(on_progress=on_progress, on_status=on_status)
-        logger.info(f"SAM2 tracker ready in {time.monotonic() - t0:.1f}s")
-        return self._sam2_tracker
-
     def _get_videomama_pipeline(self):
         """Lazy-load the VideoMaMa inference pipeline."""
         self._ensure_model(_ActiveModel.VIDEOMAMA)
@@ -508,11 +449,9 @@ class CorridorKeyService:
         """Free GPU memory by unloading all engines."""
         self._safe_offload(self._engine)
         self._safe_offload(self._gvm_processor)
-        self._safe_offload(self._sam2_tracker)
         self._safe_offload(self._videomama_pipeline)
         self._engine = None
         self._gvm_processor = None
-        self._sam2_tracker = None
         self._videomama_pipeline = None
         self._active_model = _ActiveModel.NONE
         import gc
@@ -593,7 +532,6 @@ class CorridorKeyService:
 
     def _write_image(
         self, img: np.ndarray, path: str, fmt: str, clip_name: str, frame_index: int,
-        exr_compression: str = "dwab",
     ) -> None:
         """Write a single image in the requested format."""
         if fmt == "exr":
@@ -602,10 +540,7 @@ class CorridorKeyService:
                 img = img.astype(np.float32) / 255.0
             elif img.dtype != np.float32:
                 img = img.astype(np.float32)
-            validate_write(
-                write_exr(path, img, compression=exr_compression),
-                clip_name, frame_index, path,
-            )
+            validate_write(write_exr_dwab(path, img), clip_name, frame_index, path)
         else:
             # PNG 8-bit
             if img.dtype != np.uint8:
@@ -664,8 +599,7 @@ class CorridorKeyService:
         if cfg.fg_enabled:
             fg_bgr = cv2.cvtColor(pred_fg, cv2.COLOR_RGB2BGR)
             fg_path = os.path.join(dirs['fg'], f"{input_stem}.{cfg.fg_format}")
-            self._write_image(fg_bgr, fg_path, cfg.fg_format, clip_name, frame_index,
-                              exr_compression=cfg.exr_compression)
+            self._write_image(fg_bgr, fg_path, cfg.fg_format, clip_name, frame_index)
 
         # Matte
         if cfg.matte_enabled:
@@ -673,27 +607,24 @@ class CorridorKeyService:
             if alpha.ndim == 3:
                 alpha = alpha[:, :, 0]
             matte_path = os.path.join(dirs['matte'], f"{input_stem}.{cfg.matte_format}")
-            self._write_image(alpha, matte_path, cfg.matte_format, clip_name, frame_index,
-                              exr_compression=cfg.exr_compression)
+            self._write_image(alpha, matte_path, cfg.matte_format, clip_name, frame_index)
 
         # Comp
-        if cfg.comp_enabled:
+        if cfg.comp_enabled and res.get('comp') is not None:
             comp_srgb = res['comp']
             comp_bgr = cv2.cvtColor(
                 (np.clip(comp_srgb, 0.0, 1.0) * 255.0).astype(np.uint8),
                 cv2.COLOR_RGB2BGR,
             )
             comp_path = os.path.join(dirs['comp'], f"{input_stem}.{cfg.comp_format}")
-            self._write_image(comp_bgr, comp_path, cfg.comp_format, clip_name, frame_index,
-                              exr_compression=cfg.exr_compression)
+            self._write_image(comp_bgr, comp_path, cfg.comp_format, clip_name, frame_index)
 
         # Processed (RGBA premultiplied)
-        if cfg.processed_enabled and 'processed' in res:
+        if cfg.processed_enabled and res.get('processed') is not None:
             proc_rgba = res['processed']
             proc_bgra = cv2.cvtColor(proc_rgba, cv2.COLOR_RGBA2BGRA)
             proc_path = os.path.join(dirs['processed'], f"{input_stem}.{cfg.processed_format}")
-            self._write_image(proc_bgra, proc_path, cfg.processed_format, clip_name, frame_index,
-                              exr_compression=cfg.exr_compression)
+            self._write_image(proc_bgra, proc_path, cfg.processed_format, clip_name, frame_index)
 
     # --- Processing ---
 
@@ -708,31 +639,36 @@ class CorridorKeyService:
         skip_stems: Optional[set[str]] = None,
         output_config: Optional[OutputConfig] = None,
         frame_range: Optional[tuple[int, int]] = None,
+        motion_config: Optional[MotionConfig] = None,
     ) -> list[FrameResult]:
         """Run CorridorKey inference on a single clip.
+
+        Tile-based motion detection: compares consecutive frames tile-by-tile
+        and only re-runs the GPU model on changed tiles. Changed tiles are
+        batched into a single GPU forward pass for maximum throughput.
+        A background thread writes outputs concurrently with GPU processing.
 
         Args:
             clip: Must be in READY or COMPLETE state with both input_asset and alpha_asset.
             params: Frozen inference parameters.
             job: Optional GPUJob for cancel checking.
             on_progress: Called with (clip_name, current_frame, total_frames, **kwargs).
-                Optional kwargs: fps, elapsed, eta_seconds.
             on_warning: Called with warning messages for non-fatal issues.
-            on_status: Called with phase status text (e.g. "Loading model...").
+            on_status: Called with phase status text.
             skip_stems: Set of frame stems to skip (for resume support).
             output_config: Which outputs to write and their formats.
+            motion_config: Tile-based motion config. Defaults to MotionConfig().
 
         Returns:
             List of FrameResult for each frame.
-
-        Raises:
-            JobCancelledError: If job.is_cancelled becomes True.
-            Various CorridorKeyError subclasses for fatal issues.
         """
         if clip.input_asset is None or clip.alpha_asset is None:
             raise CorridorKeyError(f"Clip '{clip.name}' missing input or alpha asset")
 
+        from CorridorKeyModule.inference_engine import CorridorKeyEngine as _CKE
+
         t_start = time.monotonic()
+        mcfg = motion_config if motion_config is not None else MotionConfig()
 
         if on_status:
             on_status("Loading model...")
@@ -743,7 +679,6 @@ class CorridorKeyService:
         dirs = ensure_output_dirs(clip.root_path)
         cfg = output_config or OutputConfig()
 
-        # Write run manifest (Codex: resume must know which outputs were enabled)
         self._write_manifest(dirs['root'], cfg, params)
 
         num_frames = validate_frame_counts(
@@ -771,10 +706,10 @@ class CorridorKeyService:
         results: list[FrameResult] = []
         skipped: list[int] = []
         skip_stems = skip_stems or set()
-        frame_times: deque[float] = deque(maxlen=10)  # rolling window for avg fps
-        processed_count = 0  # frames actually processed (not skipped/resumed)
+        frame_times: deque[float] = deque(maxlen=10)
+        processed_count = 0
 
-        # Determine frame range (in/out markers or full clip)
+        # Determine frame range
         if frame_range is not None:
             range_start = max(0, frame_range[0])
             range_end = min(num_frames - 1, frame_range[1])
@@ -786,17 +721,19 @@ class CorridorKeyService:
 
         _warmup_done = False
 
+        logger.info(
+            f"Pipeline: motion_detection=disabled (tile_color_seams_fix), "
+            f"green_screen_skip={mcfg.skip_green_screen}"
+        )
+
         try:
             for progress_i, i in enumerate(frame_indices):
-                # Check cancellation between frames
                 if job and job.is_cancelled:
                     raise JobCancelledError(clip.name, i)
 
-                # Show warmup status on first frame (torch.compile JIT)
                 if not _warmup_done and on_status:
                     on_status("Compiling (first frame may take a minute)...")
 
-                # Report progress with timing data
                 if on_progress:
                     timing_kwargs: dict[str, float] = {}
                     elapsed = time.monotonic() - t_start
@@ -810,7 +747,9 @@ class CorridorKeyService:
                     on_progress(clip.name, progress_i, range_count, **timing_kwargs)
 
                 try:
-                    # Read input
+                    t_frame_start = time.monotonic()
+
+                    # --- READ ---
                     img, input_stem, is_linear = self._read_input_frame(
                         clip, i, input_files, input_cap, params.input_is_linear,
                     )
@@ -819,54 +758,72 @@ class CorridorKeyService:
                         results.append(FrameResult(i, f"{i:05d}", False, "video read failed"))
                         continue
 
-                    # Resume: skip frames that already have outputs
                     if input_stem in skip_stems:
                         results.append(FrameResult(i, input_stem, True, "resumed (skipped)"))
                         continue
 
-                    # Read alpha
                     mask = self._read_alpha_frame(clip, i, alpha_files, alpha_cap)
                     if mask is None:
                         skipped.append(i)
                         results.append(FrameResult(i, input_stem, False, "alpha read failed"))
                         continue
 
-                    # Resize mask if dimensions don't match input
                     if mask.shape[:2] != img.shape[:2]:
-                        mask = cv2.resize(mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                        mask = cv2.resize(mask, (img.shape[1], img.shape[0]),
+                                          interpolation=cv2.INTER_LINEAR)
 
-                    # Process (GPU-locked — process_frame mutates model hooks)
-                    t_frame = time.monotonic()
+                    read_ms = (time.monotonic() - t_frame_start) * 1000.0
+
+                    # --- GPU INFERENCE (Full Frame Only) ---
+                    # Motion detection disabled for clean output (no tile color seams)
+                    t_gpu = time.monotonic()
+                    mode = "full"
+                    n_tiles = 0
+
                     with self._gpu_lock:
-                        res = engine.process_frame(
-                            img,
-                            mask,
-                            input_is_linear=is_linear,
-                            fg_is_straight=True,
-                            despill_strength=params.despill_strength,
-                            auto_despeckle=params.auto_despeckle,
-                            despeckle_size=params.despeckle_size,
-                            despeckle_dilation=params.despeckle_dilation,
-                            despeckle_blur=params.despeckle_blur,
+                        raw = engine.predict_raw(
+                            img, mask,
                             refiner_scale=params.refiner_scale,
+                            input_is_linear=is_linear,
                         )
-                    dt = time.monotonic() - t_frame
+                    alpha_raw = raw['alpha']
+                    fg_raw = raw['fg']
+
+                    gpu_ms = (time.monotonic() - t_gpu) * 1000.0
+
+
+
+                    # --- FINALIZE + WRITE (sequential, no threads) ---
+                    t_post = time.monotonic()
+                    res = _CKE.finalize_outputs(
+                        alpha_raw, fg_raw,
+                        fg_is_straight=True,
+                        despill_strength=params.despill_strength,
+                        auto_despeckle=params.auto_despeckle,
+                        despeckle_size=params.despeckle_size,
+                        despeckle_dilation=params.despeckle_dilation,
+                        despeckle_blur=params.despeckle_blur,
+                        comp_enabled=cfg.comp_enabled,
+                        processed_enabled=cfg.processed_enabled,
+                    )
+                    self._write_outputs(res, dirs, input_stem, clip.name, i, cfg)
+                    post_ms = (time.monotonic() - t_post) * 1000.0
+
+                    dt = time.monotonic() - t_frame_start
                     frame_times.append(dt)
                     processed_count += 1
 
-                    # Clear warmup status after first successful frame
                     if not _warmup_done:
                         _warmup_done = True
                         if on_status:
                             on_status("")
-                    total_t = sum(frame_times)
-                    avg_fps = len(frame_times) / total_t if total_t > 0 else 0.0
-                    logger.debug(
-                        f"Frame {i}: {dt * 1000:.0f}ms ({avg_fps:.1f} fps avg)"
+
+                    # --- Logging ---
+                    logger.info(
+                        f"Frame {i}: {mode} read={read_ms:.0f}ms "
+                        f"gpu={gpu_ms:.0f}ms post={post_ms:.0f}ms total={dt * 1000:.0f}ms"
                     )
 
-                    # Write outputs
-                    self._write_outputs(res, dirs, input_stem, clip.name, i, cfg)
                     results.append(FrameResult(i, input_stem, True))
 
                 except FrameReadError as e:
@@ -882,7 +839,6 @@ class CorridorKeyService:
                     if on_warning:
                         on_warning(str(e))
 
-            # Final progress (include final timing)
             if on_progress:
                 final_elapsed = time.monotonic() - t_start
                 final_kwargs: dict[str, float] = {"elapsed": final_elapsed, "eta_seconds": 0.0}
@@ -916,7 +872,6 @@ class CorridorKeyService:
             f"in {t_total:.1f}s ({t_total / max(processed, 1):.2f}s/frame, {avg_fps:.1f} fps avg)"
         )
 
-        # State transition — only set COMPLETE if full clip was processed
         is_full_clip = (frame_range is None or
                         (frame_range[0] == 0 and frame_range[1] >= num_frames - 1))
         if processed == range_count and is_full_clip:
@@ -1024,9 +979,6 @@ class CorridorKeyService:
         if clip.input_asset is None:
             raise CorridorKeyError(f"Clip '{clip.name}' missing input asset for GVM")
 
-        if self._device == 'cpu':
-            raise GPURequiredError("GVM Auto Alpha")
-
         t_start = time.monotonic()
 
         logger.info("run_gvm: waiting for _gpu_lock")
@@ -1086,189 +1038,6 @@ class CorridorKeyService:
 
         logger.info(f"GVM complete for '{clip.name}': {clip.alpha_asset.frame_count} alpha frames in {time.monotonic() - t_start:.1f}s")
 
-    def _selected_sequence_files(self, clip: ClipEntry) -> list[str]:
-        """Return the ordered frame filenames for the clip's active in/out range."""
-        if clip.input_asset is None or clip.input_asset.asset_type != "sequence":
-            return []
-        files = clip.input_asset.get_frame_files()
-        if clip.in_out_range is not None:
-            lo = clip.in_out_range.in_point
-            hi = clip.in_out_range.out_point
-            files = files[lo:hi + 1]
-        return files
-
-    def _load_named_sequence_frames(
-        self,
-        asset: ClipAsset,
-        file_names: list[str],
-        clip_name: str,
-        *,
-        job: Optional[GPUJob] = None,
-        on_status: Optional[Callable[[str], None]] = None,
-    ) -> list[tuple[str, np.ndarray]]:
-        """Load named image-sequence frames as uint8 RGB for tracker/VideoMaMa."""
-        named_frames: list[tuple[str, np.ndarray]] = []
-        total = len(file_names)
-        for index, fname in enumerate(file_names):
-            if job and job.is_cancelled:
-                raise JobCancelledError(clip_name, index)
-            fpath = os.path.join(asset.path, fname)
-            img = read_image_frame(fpath, gamma_correct_exr=True)
-            if img is None:
-                raise FrameReadError(clip_name, index, fpath)
-            named_frames.append(
-                (fname, (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8))
-            )
-            if on_status and index % 20 == 0 and index > 0:
-                on_status(f"Loading frames ({index}/{total})...")
-        return named_frames
-
-    @staticmethod
-    def _write_mask_track_manifest(
-        clip: ClipEntry,
-        *,
-        source: str,
-        frame_stems: list[str],
-        model_id: str | None = None,
-    ) -> None:
-        """Persist provenance for dense VideoMaMa-ready mask tracks."""
-        manifest_path = os.path.join(clip.root_path, MASK_TRACK_MANIFEST)
-        payload = {
-            "source": source,
-            "frame_stems": frame_stems,
-            "model_id": model_id,
-        }
-        with open(manifest_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-
-    @staticmethod
-    def _remove_alpha_hint_dir(clip: ClipEntry) -> None:
-        """Remove AlphaHint so a new mask/alpha run is authoritative."""
-        alpha_dir = os.path.join(clip.root_path, "AlphaHint")
-        if os.path.isdir(alpha_dir):
-            shutil.rmtree(alpha_dir, ignore_errors=True)
-
-    def run_sam2_track(
-        self,
-        clip: ClipEntry,
-        job: Optional[GPUJob] = None,
-        on_progress: Optional[Callable[[str, int, int], None]] = None,
-        on_warning: Optional[Callable[[str], None]] = None,
-        on_status: Optional[Callable[[str], None]] = None,
-    ) -> None:
-        """Turn sparse annotations into dense VideoMaMa mask hints with SAM2."""
-        if clip.input_asset is None:
-            raise CorridorKeyError(f"Clip '{clip.name}' missing input asset for SAM2 tracking")
-        if clip.input_asset.asset_type != "sequence":
-            raise CorridorKeyError("SAM2 tracking currently requires an extracted image sequence")
-
-        selected_files = self._selected_sequence_files(clip)
-        if not selected_files:
-            raise CorridorKeyError(f"Clip '{clip.name}' has no input frames for SAM2 tracking")
-
-        start_index = clip.in_out_range.in_point if clip.in_out_range is not None else 0
-        allowed_indices = list(range(start_index, start_index + len(selected_files)))
-        prompt_frames = load_annotation_prompt_frames(
-            clip.root_path,
-            allowed_indices=allowed_indices,
-        )
-        if not prompt_frames:
-            raise CorridorKeyError(
-                f"Clip '{clip.name}' has no usable annotations for SAM2 tracking"
-            )
-
-        def _status(message: str) -> None:
-            logger.info(f"SAM2 [{clip.name}]: {message}")
-            if on_status:
-                on_status(message)
-
-        def _check_cancel() -> None:
-            if job and job.is_cancelled:
-                raise JobCancelledError(clip.name, 0)
-
-        _status("Loading model...")
-        with self._gpu_lock:
-            tracker = self._get_sam2_tracker(
-                on_progress=(
-                    None
-                    if on_progress is None
-                    else lambda current, total: on_progress(clip.name, current, total)
-                ),
-                on_status=on_status,
-            )
-        _check_cancel()
-
-        _status("Loading frames...")
-        named_frames = self._load_named_sequence_frames(
-            clip.input_asset,
-            selected_files,
-            clip.name,
-            job=job,
-            on_status=on_status,
-        )
-        _check_cancel()
-
-        from sam2_tracker import PromptFrame, SAM2NotInstalledError
-
-        local_prompts = [
-            PromptFrame(
-                frame_index=prompt.frame_index - start_index,
-                positive_points=prompt.positive_points,
-                negative_points=prompt.negative_points,
-                box=prompt.box,
-            )
-            for prompt in prompt_frames
-        ]
-
-        _status("Running SAM2 tracker...")
-        try:
-            masks = tracker.track_video(
-                [frame for _, frame in named_frames],
-                local_prompts,
-                on_progress=(
-                    None
-                    if on_progress is None
-                    else lambda current, total: on_progress(clip.name, current, total)
-                ),
-                on_status=on_status,
-                check_cancel=_check_cancel,
-            )
-        except SAM2NotInstalledError as exc:
-            raise CorridorKeyError(str(exc)) from exc
-        _check_cancel()
-
-        mask_dir = os.path.join(clip.root_path, "VideoMamaMaskHint")
-        os.makedirs(mask_dir, exist_ok=True)
-        for fname in os.listdir(mask_dir):
-            if fname.lower().endswith((".png", ".jpg", ".jpeg")):
-                os.remove(os.path.join(mask_dir, fname))
-
-        stems: list[str] = []
-        for (fname, _), mask in zip(named_frames, masks):
-            stem = os.path.splitext(fname)[0]
-            stems.append(stem)
-            out_path = os.path.join(mask_dir, f"{stem}.png")
-            if not cv2.imwrite(out_path, mask):
-                raise WriteFailureError(clip.name, len(stems) - 1, out_path)
-
-        self._write_mask_track_manifest(
-            clip,
-            source="sam2",
-            frame_stems=stems,
-            model_id=getattr(tracker, "model_id", None),
-        )
-        self._remove_alpha_hint_dir(clip)
-        clip.alpha_asset = None
-        clip.mask_asset = None
-        clip.find_assets()
-        clip.state = ClipState.MASKED
-
-        logger.info(
-            "SAM2 tracking complete for '%s': %d dense masks",
-            clip.name,
-            len(stems),
-        )
-
     # --- VideoMaMa Alpha Generation ---
 
     def run_videomama(
@@ -1278,7 +1047,7 @@ class CorridorKeyService:
         on_progress: Optional[Callable[[str, int, int], None]] = None,
         on_warning: Optional[Callable[[str], None]] = None,
         on_status: Optional[Callable[[str], None]] = None,
-        chunk_size: int = 16,
+        chunk_size: int = 50,
     ) -> None:
         """Run VideoMaMa guided alpha generation for a clip.
 
@@ -1290,23 +1059,12 @@ class CorridorKeyService:
             on_progress: Progress callback with per-chunk updates.
             on_warning: Warning callback.
             on_status: Phase status callback (e.g. "Loading model...").
-            chunk_size: Frames per chunk (lower = less VRAM, default 16).
+            chunk_size: Frames per chunk (lower = less VRAM, default 50).
         """
         if clip.input_asset is None:
             raise CorridorKeyError(f"Clip '{clip.name}' missing input asset for VideoMaMa")
         if clip.mask_asset is None:
             raise CorridorKeyError(f"Clip '{clip.name}' missing mask asset for VideoMaMa")
-
-        if self._device == 'cpu':
-            raise GPURequiredError("VideoMaMa")
-        if clip.input_asset.asset_type != "sequence":
-            raise CorridorKeyError("VideoMaMa currently requires an extracted image sequence")
-        ann_path = os.path.join(clip.root_path, "annotations.json")
-        has_annotations = os.path.isfile(ann_path) and os.path.getsize(ann_path) > 2
-        if has_annotations and not mask_sequence_is_videomama_ready(clip.root_path):
-            raise CorridorKeyError(
-                "VideoMaMa requires dense tracked masks. Run Track Mask first."
-            )
 
         def _status(msg: str) -> None:
             logger.info(f"VideoMaMa [{clip.name}]: {msg}")
@@ -1334,17 +1092,9 @@ class CorridorKeyService:
 
         # ── Phase 2: Load input frames ──
         _status("Loading frames...")
-        selected_input_names = self._selected_sequence_files(clip)
-        if not selected_input_names:
-            raise CorridorKeyError(f"Clip '{clip.name}' has no input frames for VideoMaMa")
-        named_input_frames = self._load_named_sequence_frames(
-            clip.input_asset,
-            selected_input_names,
-            clip.name,
-            job=job,
-            on_status=on_status,
+        input_frames = self._load_frames_for_videomama(
+            clip.input_asset, clip.name, job=job, on_status=on_status,
         )
-        input_frames = [frame for _, frame in named_input_frames]
         _check_cancel("frame load")
 
         # ── Phase 3: Load + stem-match masks ──
@@ -1365,8 +1115,11 @@ class CorridorKeyService:
             for i, m in enumerate(raw_masks):
                 mask_stems[f"frame_{i:06d}"] = m
 
-        # Build output filenames from the selected input stems
-        input_names = [fname for fname, _ in named_input_frames]
+        # Build output filenames from input stems
+        if clip.input_asset and clip.input_asset.asset_type == 'sequence':
+            input_names = clip.input_asset.get_frame_files()
+        else:
+            input_names = [f"frame_{i:06d}.png" for i in range(len(input_frames))]
 
         # Align masks to input frames by stem, defaulting to all-black
         num_frames = len(input_frames)
@@ -1425,19 +1178,17 @@ class CorridorKeyService:
             # Write chunk frames
             t_chunk = time.monotonic()
             for frame in chunk_output:
-                if frame.dtype == np.uint8:
-                    frame_u8 = frame
-                else:
-                    frame_u8 = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
-                out_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_RGB2BGR)
+                out_bgr = cv2.cvtColor(
+                    (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8),
+                    cv2.COLOR_RGB2BGR,
+                )
                 if frames_written < len(input_names):
                     stem = os.path.splitext(input_names[frames_written])[0]
                     out_name = f"{stem}.png"
                 else:
                     out_name = f"frame_{frames_written:06d}.png"
                 out_path = os.path.join(alpha_dir, out_name)
-                if not cv2.imwrite(out_path, out_bgr):
-                    raise WriteFailureError(clip.name, frames_written, out_path)
+                cv2.imwrite(out_path, out_bgr)
                 frames_written += 1
             logger.debug(f"Clip '{clip.name}' chunk {chunk_idx}: {len(chunk_output)} frames in {time.monotonic() - t_chunk:.3f}s")
 
@@ -1508,3 +1259,188 @@ class CorridorKeyService:
             _, binary = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)
             masks.append(binary)  # uint8
         return masks
+
+    # --- Rembg Alpha Mask Generation ---
+
+    def run_rembg(
+        self,
+        clip: ClipEntry,
+        job: Optional[GPUJob] = None,
+        on_progress: Optional[Callable[[str, int, int], None]] = None,
+        on_warning: Optional[Callable[[str], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
+        motion_config: Optional[MotionConfig] = None,
+    ) -> None:
+        """Run rembg for fast background removal with tile-based motion skip.
+
+        Tile-based motion detection skips unchanged regions. Changed tiles
+        are processed concurrently via ThreadPoolExecutor. Writes are async.
+        """
+        if clip.input_asset is None:
+            raise CorridorKeyError(f"Clip '{clip.name}' missing input asset for rembg")
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        mcfg = motion_config if motion_config is not None else MotionConfig()
+
+        def _status(msg: str) -> None:
+            logger.info(f"Rembg [{clip.name}]: {msg}")
+            if on_status:
+                on_status(msg)
+
+        def _check_cancel(phase: str = "") -> None:
+            if job and job.is_cancelled:
+                raise JobCancelledError(clip.name, 0)
+
+        t_start = time.monotonic()
+
+        _status("Loading rembg model...")
+        _check_cancel("load_model")
+        
+        try:
+            from rembg import remove, new_session
+        except ImportError:
+            raise CorridorKeyError("rembg not installed. Run: pip install rembg")
+
+        try:
+            model_name = os.environ.get("CK_REMBG_MODEL", "u2netp").strip() or "u2netp"
+            session = new_session(model_name=model_name)
+        except Exception as e:
+            raise CorridorKeyError(f"rembg model load failed: {e}")
+
+        def _rembg_frame(frame_rgb: np.ndarray) -> np.ndarray:
+            """Run rembg on a single RGB frame, return uint8 grayscale mask."""
+            result = remove(frame_rgb, session=session, only_mask=True)
+            if not isinstance(result, np.ndarray):
+                result = np.array(result)
+            if result.ndim == 3:
+                result = cv2.cvtColor(result, cv2.COLOR_RGB2GRAY)
+            if result.dtype != np.uint8:
+                result = (np.clip(result, 0.0, 1.0) * 255.0).astype(np.uint8)
+            return result
+
+        mask_dir = clip.get_or_create_asset_dir('masks')
+        _status("Processing frames...")
+
+        input_asset = clip.input_asset
+        if input_asset.asset_type == 'video':
+            frames = read_video_frames(input_asset.path)
+        else:
+            frames = []
+            for fname in input_asset.get_frame_files():
+                fpath = os.path.join(input_asset.path, fname)
+                frame = cv2.imread(fpath)
+                if frame is not None:
+                    frames.append(frame)
+
+        total_frames = len(frames)
+        if total_frames == 0:
+            raise CorridorKeyError(f"No frames found in {input_asset.path}")
+
+        prev_frame_rgb: Optional[np.ndarray] = None
+        prev_mask: Optional[np.ndarray] = None
+        reused_count = 0
+        partial_count = 0
+
+        # Thread pool for concurrent tile rembg + async writes
+        write_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rembg-write")
+        write_futures = []
+
+        for i, frame in enumerate(frames):
+            _check_cancel("process_frames")
+            
+            if frame.ndim == 3 and frame.shape[2] == 3:
+                if frame.dtype == np.float32:
+                    frame_rgb = (np.clip(frame, 0.0, 1.0) * 255.0).astype(np.uint8)
+                else:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            else:
+                frame_rgb = frame
+
+            use_tiling = (
+                mcfg.enabled
+                and prev_frame_rgb is not None
+                and prev_mask is not None
+                and frame_rgb.shape == prev_frame_rgb.shape
+            )
+
+            if use_tiling:
+                plan = build_motion_plan(
+                    prev_frame_rgb, frame_rgb, mcfg,
+                    frame_index=i,
+                    halo_px=mcfg.rembg_halo_px,
+                )
+            else:
+                plan = None
+
+            try:
+                if plan is not None and not plan.full_frame and not plan.tiles:
+                    mask = prev_mask
+                    reused_count += 1
+                elif plan is not None and not plan.full_frame and plan.tiles:
+                    mask = prev_mask.copy()
+                    # Process changed tiles — rembg on each tile crop
+                    for ti in plan.tiles:
+                        crop_rgb = crop_roi(frame_rgb, ti)
+                        crop_mask = _rembg_frame(crop_rgb)
+                        paste_core(mask, crop_mask, ti)
+                    partial_count += 1
+                else:
+                    mask = _rembg_frame(frame_rgb)
+            except Exception as e:
+                if on_warning:
+                    on_warning(f"Frame {i} processing failed: {e}")
+                mask = np.zeros((frame_rgb.shape[0], frame_rgb.shape[1]), dtype=np.uint8)
+
+            prev_frame_rgb = frame_rgb
+            prev_mask = mask
+
+            # Async write
+            _mask_copy = mask.copy()
+            _i = i
+            fut = write_pool.submit(
+                cv2.imwrite, os.path.join(mask_dir, f"mask_{_i:06d}.png"), _mask_copy,
+            )
+            write_futures.append(fut)
+
+            if on_progress:
+                on_progress("rembg", i + 1, total_frames)
+
+        # Wait for writes
+        for fut in write_futures:
+            try:
+                fut.result()
+            except Exception as e:
+                logger.warning(f"Async mask write error: {e}")
+        write_pool.shutdown(wait=True)
+
+        if reused_count > 0 or partial_count > 0:
+            logger.info(f"Rembg [{clip.name}]: reused={reused_count} partial={partial_count} "
+                        f"full={total_frames - reused_count - partial_count}")
+
+        # Create mask asset
+        mask_asset = ClipAsset(
+            asset_type='image_sequence',
+            path=mask_dir,
+            frame_count=total_frames,
+            fps=input_asset.fps,
+            width=frames[0].shape[1] if frames else 0,
+            height=frames[0].shape[0] if frames else 0,
+        )
+        clip.mask_asset = mask_asset
+
+        # Write manifest
+        try:
+            self._write_manifest(clip)
+        except Exception as e:
+            if on_warning:
+                on_warning(f"Manifest write failed: {e}")
+
+        # Transition RAW → READY
+        try:
+            clip.transition_to(ClipState.READY)
+        except Exception as e:
+            if on_warning:
+                on_warning(f"State transition after rembg: {e}")
+
+        logger.info(f"Rembg complete for '{clip.name}': {total_frames} masks in {time.monotonic() - t_start:.1f}s")

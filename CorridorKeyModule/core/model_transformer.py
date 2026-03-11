@@ -130,9 +130,14 @@ class CNNRefinerModule(nn.Module):
     def compile_tile_kernel(self):
         """Compile the fixed-shape tile CNN without changing checkpoint keys."""
         if self._compiled_process_tile is None:
-            self._compiled_process_tile = torch.compile(
-                self._process_tile_impl, dynamic=False, fullgraph=True,
-            )
+            # Skip torch.compile on MPS (TorchDynamo doesn't support it well)
+            device = next(self.parameters()).device
+            if device.type == 'mps':
+                self._compiled_process_tile = None
+            else:
+                self._compiled_process_tile = torch.compile(
+                    self._process_tile_impl, dynamic=False, fullgraph=True,
+                )
 
     def _process_tile(self, x):
         if self._compiled_process_tile is not None:

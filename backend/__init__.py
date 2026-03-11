@@ -2,8 +2,7 @@
 
 from .clip_state import (
     ClipAsset, ClipEntry, ClipState, InOutRange, PipelineRoute,
-    classify_pipeline_route, mask_sequence_is_videomama_ready,
-    scan_clips_dir, scan_project_clips,
+    classify_pipeline_route, scan_clips_dir, scan_project_clips,
 )
 from .errors import CorridorKeyError
 from .job_queue import GPUJob, GPUJobQueue, JobType, JobStatus
@@ -21,6 +20,7 @@ from .project import (
 )
 from .natural_sort import natural_sort_key, natsorted
 from .service import CorridorKeyService, InferenceParams, OutputConfig
+from .tile_motion import MotionConfig
 
 __all__ = [
     # Service
@@ -34,7 +34,6 @@ __all__ = [
     "InOutRange",
     "PipelineRoute",
     "classify_pipeline_route",
-    "mask_sequence_is_videomama_ready",
     "scan_clips_dir",
     "scan_project_clips",
     # Job queue
@@ -70,4 +69,6 @@ __all__ = [
     # Natural sort
     "natural_sort_key",
     "natsorted",
+    # Tile motion
+    "MotionConfig",
 ]

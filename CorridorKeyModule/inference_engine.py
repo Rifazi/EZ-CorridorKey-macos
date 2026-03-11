@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 from .core.model_transformer import GreenFormer
 from .core import color_utils as cu
 
+# Cache for linearized checkerboard backgrounds keyed by (width, height)
+_bg_lin_cache: dict[tuple[int, int], np.ndarray] = {}
+
 def _patch_hiera_global_attention(hiera_model: nn.Module) -> int:
     """Monkey-patch MaskUnitAttention.forward on global-attention blocks.
 
@@ -45,7 +48,7 @@ def _patch_hiera_global_attention(hiera_model: nn.Module) -> int:
                 q, k, v = qkv.unbind(0)             # each [B, heads, N, head_dim]
 
                 if self.q_stride > 1:
-                    q = q.view(
+                    q = q.reshape(
                         B, self.heads, self.q_stride, -1, self.head_dim
                     ).amax(dim=2)
 
@@ -86,9 +89,6 @@ class CorridorKeyEngine:
         self.use_refiner = use_refiner
         self.tile_overlap = tile_overlap
         self._on_status = on_status
-        self._eager_model = None
-        self._compiled_model = None
-        self._compile_error = None
 
         # Allow env var override: CORRIDORKEY_OPT_MODE=speed|lowvram|auto
         env_mode = os.environ.get('CORRIDORKEY_OPT_MODE', '').lower()
@@ -100,10 +100,9 @@ class CorridorKeyEngine:
         # Low-VRAM mode keeps tiling, but graph-breaks the tile scheduler and
         # compiles the fixed-shape tile CNN separately.
         #
-        # NOTE: _get_vram_gb() uses pynvml first (driver-level, no CUDA
-        # context) so it's safe during model handoff (GVM -> inference).
-        # The old torch.cuda.get_device_properties() call stalled after
-        # GVM teardown — pynvml doesn't have that problem.
+        # NOTE: MPS (Apple Silicon) requires tiling even with plenty of memory
+        # because it doesn't parallelize well across large tensors.
+        # _get_vram_gb() uses pynvml first (CUDA), then torch.cuda, then MPS.
         if optimization_mode == 'speed':
             self.tile_size = 0
             self._use_compile = True
@@ -113,18 +112,24 @@ class CorridorKeyEngine:
             self._use_compile = True
             logger.info("Optimization: low-VRAM mode (tiled refiner 512x512 + selective torch.compile)")
         else:  # auto
-            logger.info("Optimization: auto mode - probing VRAM...")
-            vram_gb = self._get_vram_gb()
-            if vram_gb > 0 and vram_gb < self._VRAM_TILE_THRESHOLD_GB:
+            logger.info("Optimization: auto mode - probing device...")
+            # MPS always needs tiling for good performance
+            if self.device.type == 'mps':
                 self.tile_size = 512
                 self._use_compile = True
-                logger.info(f"Optimization: auto -> low-VRAM mode "
-                            f"({vram_gb:.1f} GB < {self._VRAM_TILE_THRESHOLD_GB} GB threshold)")
+                logger.info("Optimization: MPS detected -> low-VRAM mode (forced tiling for MPS)")
             else:
-                self.tile_size = 0
-                self._use_compile = True
-                logger.info(f"Optimization: auto -> speed mode "
-                            f"({vram_gb:.1f} GB >= {self._VRAM_TILE_THRESHOLD_GB} GB threshold)")
+                vram_gb = self._get_vram_gb()
+                if vram_gb > 0 and vram_gb < self._VRAM_TILE_THRESHOLD_GB:
+                    self.tile_size = 512
+                    self._use_compile = True
+                    logger.info(f"Optimization: auto -> low-VRAM mode "
+                                f"({vram_gb:.1f} GB < {self._VRAM_TILE_THRESHOLD_GB} GB threshold)")
+                else:
+                    self.tile_size = 0
+                    self._use_compile = True
+                    logger.info(f"Optimization: auto -> speed mode "
+                                f"({vram_gb:.1f} GB >= {self._VRAM_TILE_THRESHOLD_GB} GB threshold)")
 
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
@@ -136,7 +141,7 @@ class CorridorKeyEngine:
     def _get_vram_gb() -> float:
         """Return total GPU VRAM in GB.
 
-        Prefer NVML (no CUDA context calls) and fall back to torch.cuda.
+        Tries NVML (CUDA), torch.cuda, then MPS.
         """
         logger.debug("_get_vram_gb: entering")
         try:
@@ -161,6 +166,20 @@ class CorridorKeyEngine:
                 return vram
         except Exception as e:
             logger.debug(f"_get_vram_gb: torch.cuda failed: {e}")
+
+        # MPS (Apple Silicon) — use psutil to estimate shared unified memory
+        try:
+            logger.debug("_get_vram_gb: checking for MPS device...")
+            if torch.backends.mps.is_available():
+                import psutil
+                # MPS uses unified memory; return total system memory as approximation
+                mem_info = psutil.virtual_memory()
+                vram = mem_info.total / (1024 ** 3)
+                logger.debug(f"_get_vram_gb: MPS detected, total memory: {vram:.1f} GB")
+                return vram
+        except Exception as e:
+            logger.debug(f"_get_vram_gb: MPS probe failed: {e}")
+
         logger.debug("_get_vram_gb: all probes failed, returning 0")
         return 0.0
         
@@ -169,82 +188,6 @@ class CorridorKeyEngine:
         logger.info(msg)
         if self._on_status:
             self._on_status(msg)
-
-    @staticmethod
-    def _iter_exception_chain(exc: Exception):
-        """Yield an exception plus its cause/context chain without looping."""
-        seen = set()
-        current = exc
-        while current is not None and id(current) not in seen:
-            seen.add(id(current))
-            yield current
-            current = current.__cause__ or current.__context__
-
-    def _has_compiled_artifacts(self) -> bool:
-        """Return True if this engine may still touch compiled Torch/Triton code."""
-        refiner = getattr(self._eager_model, 'refiner', None)
-        tile_kernel = getattr(refiner, '_compiled_process_tile', None) if refiner is not None else None
-        return self._compiled_model is not None or tile_kernel is not None
-
-    def _is_compile_failure(self, exc: Exception) -> bool:
-        """Best-effort filter for torch.compile/Triton/Inductor runtime failures."""
-        markers = (
-            'triton',
-            'torchinductor',
-            'torch._inductor',
-            'torch._dynamo',
-            'backendcompilerfailed',
-            'loweringexception',
-            'asynccompile',
-            'compileworker',
-            'inductor',
-            'compiler: cl is not found',
-            'compiler: cl.exe is not found',
-        )
-        for err in self._iter_exception_chain(exc):
-            text = f"{type(err).__module__} {type(err).__name__} {err}".lower()
-            if any(marker in text for marker in markers):
-                return True
-        return False
-
-    def _disable_compile(self, exc: Exception) -> None:
-        """Permanently fall back to eager mode for this engine instance."""
-        self._compile_error = f"{type(exc).__name__}: {exc}"
-        self._use_compile = False
-        self._compiled_model = None
-
-        if self._eager_model is not None:
-            refiner = getattr(self._eager_model, 'refiner', None)
-            if refiner is not None and getattr(refiner, '_compiled_process_tile', None) is not None:
-                refiner._compiled_process_tile = None
-            self.model = self._eager_model
-
-        try:
-            import torch._dynamo as _dynamo
-            _dynamo.reset()
-        except Exception as reset_error:
-            logger.debug(f"dynamo reset skipped after compile failure: {reset_error}")
-
-        try:
-            if self.device.type == 'cuda' and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception as cache_error:
-            logger.debug(f"cuda cache clear skipped after compile failure: {cache_error}")
-
-        logger.warning(
-            "Compile runtime failed (%s); falling back to eager mode for this session",
-            self._compile_error,
-        )
-
-    def _forward_model(self, inp_t: torch.Tensor, refiner_scale_t: torch.Tensor):
-        """Run the model once, retrying eagerly only for compile-specific failures."""
-        try:
-            return self.model(inp_t, refiner_scale=refiner_scale_t)
-        except Exception as e:
-            if not self._has_compiled_artifacts() or not self._is_compile_failure(e):
-                raise
-            self._disable_compile(e)
-            return self.model(inp_t, refiner_scale=refiner_scale_t)
 
     def _load_model(self):
         import time as _time
@@ -326,13 +269,21 @@ class CorridorKeyEngine:
         _diag(f"Step 4 done: {_time.monotonic() - t0:.1f}s")
         logger.info(f"State dict loaded: {_time.monotonic() - t0:.1f}s")
 
-        # Enable TF32 tensor cores for FP32 matmuls (Ampere+).
-        torch.set_float32_matmul_precision('high')
-        logger.info("TF32 matmul precision set to 'high'")
+        # Enable TF32 tensor cores for FP32 matmuls (Ampere+, CUDA only).
+        if self.device.type != 'mps':
+            try:
+                torch.set_float32_matmul_precision('high')
+                logger.info("TF32 matmul precision set to 'high'")
+            except Exception as e:
+                logger.debug(f"TF32 precision not available: {e}")
 
-        # Disable cuDNN benchmark to prevent workspace memory allocation (2-5 GB).
-        torch.backends.cudnn.benchmark = False
-        logger.info("cuDNN benchmark disabled (saves 2-5 GB workspace)")
+        # Disable cuDNN benchmark to prevent workspace memory allocation (2-5 GB, CUDA only).
+        if self.device.type == 'cuda':
+            try:
+                torch.backends.cudnn.benchmark = False
+                logger.info("cuDNN benchmark disabled (saves 2-5 GB workspace)")
+            except Exception as e:
+                logger.debug(f"cuDNN benchmark disable failed: {e}")
 
         # Step 5: Hiera attention patch
         self._status("Patching attention blocks...")
@@ -350,10 +301,6 @@ class CorridorKeyEngine:
             model.refiner._tile_overlap = self.tile_overlap
             logger.info(f"Tiled refiner: {self.tile_size}x{self.tile_size} tiles, {self.tile_overlap}px overlap")
 
-        eager_model = model
-        self._eager_model = eager_model
-        self._compiled_model = None
-
         # Step 6: torch.compile (Triton JIT — slow on first run)
         if self._use_compile:
             self._status("Compiling model (first run may take a minute)...")
@@ -370,16 +317,10 @@ class CorridorKeyEngine:
                 subprocess.Popen.__init__ = _silent_popen_init
                 subprocess.Popen._corridorkey_no_window = True
 
-            try:
-                import triton  # noqa: F401
-            except Exception as e:
-                self._use_compile = False
-                logger.warning(f"Triton unavailable, skipping torch.compile: {type(e).__name__}: {e}")
-
-            if self._use_compile and self.tile_size > 0 and hasattr(eager_model, 'refiner') and eager_model.refiner is not None:
+            if self.tile_size > 0 and hasattr(model, 'refiner') and model.refiner is not None:
                 try:
                     t0 = _time.monotonic()
-                    eager_model.refiner.compile_tile_kernel()
+                    model.refiner.compile_tile_kernel()
                     logger.info(f"Refiner tile compile: {_time.monotonic() - t0:.1f}s")
                 except Exception as e:
                     logger.warning(
@@ -387,23 +328,303 @@ class CorridorKeyEngine:
                         f"{type(e).__name__}: {e}"
                     )
 
-            if self._use_compile:
+            # Skip torch.compile on MPS (TorchDynamo has issues with MPS)
+            device = next(model.parameters()).device
+            if device.type == 'mps':
+                logger.info("Skipping torch.compile on MPS device (TorchDynamo not well-supported)")
+            else:
                 try:
                     t0 = _time.monotonic()
-                    self._compiled_model = torch.compile(eager_model, fullgraph=False)
-                    model = self._compiled_model
+                    model = torch.compile(model, fullgraph=False)
                     logger.info(f"torch.compile complete: {_time.monotonic() - t0:.1f}s")
                 except Exception as e:
-                    self._compiled_model = None
                     logger.warning(f"torch.compile failed (falling back to eager): {type(e).__name__}: {e}")
 
         self._status("Model ready")
         return model
 
+    def _prepare_input(self, image, mask_linear, input_is_linear=False):
+        """Prepare a single image+mask for the model. Returns (H, W, 4) float32."""
+        if image.dtype == np.uint8:
+            image = image.astype(np.float32) / 255.0
+        if mask_linear.dtype == np.uint8:
+            mask_linear = mask_linear.astype(np.float32) / 255.0
+        if mask_linear.ndim == 2:
+            mask_linear = mask_linear[:, :, np.newaxis]
+
+        # Use INTER_AREA for downscaling (faster & better quality), INTER_LINEAR for upscaling
+        h, w = image.shape[:2]
+        interp = cv2.INTER_AREA if (w > self.img_size or h > self.img_size) else cv2.INTER_LINEAR
+        
+        if input_is_linear:
+            img_resized_lin = cv2.resize(image, (self.img_size, self.img_size), interpolation=interp)
+            img_resized = cu.linear_to_srgb(img_resized_lin)
+        else:
+            img_resized = cv2.resize(image, (self.img_size, self.img_size), interpolation=interp)
+
+        mask_resized = cv2.resize(mask_linear, (self.img_size, self.img_size), interpolation=interp)
+        if mask_resized.ndim == 2:
+            mask_resized = mask_resized[:, :, np.newaxis]
+
+        img_norm = (img_resized - self.mean) / self.std
+        return np.concatenate([img_norm, mask_resized], axis=-1)
+
     @torch.no_grad()
-    def process_frame(self, image, mask_linear, refiner_scale=1.0, input_is_linear=False, fg_is_straight=True, despill_strength=1.0, auto_despeckle=True, despeckle_size=400, despeckle_dilation=25, despeckle_blur=5):
+    def predict_raw(self, image, mask_linear, refiner_scale=1.0, input_is_linear=False):
+        """Run model inference and return raw alpha/fg at original resolution.
+
+        Args:
+            image: Numpy array [H, W, 3] (0.0-1.0 or 0-255).
+            mask_linear: Numpy array [H, W] or [H, W, 1] (0.0-1.0).
+            refiner_scale: Multiplier for Refiner Deltas.
+            input_is_linear: If True, input is linear.
+
+        Returns:
+            dict with 'alpha' [H, W, 1] and 'fg' [H, W, 3] float32.
         """
-        Process a single frame.
+        t0 = time.monotonic()
+        h, w = image.shape[:2]
+        inp_np = self._prepare_input(image, mask_linear, input_is_linear)
+        t_prep = time.monotonic()
+
+        inp_t = torch.from_numpy(inp_np.transpose((2, 0, 1))).float().unsqueeze(0).to(self.device)
+        t_to_device = time.monotonic()
+
+        refiner_scale_t = inp_t.new_tensor(refiner_scale)
+        with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+            out = self.model(inp_t, refiner_scale=refiner_scale_t)
+
+        # Sync MPS before timing — MPS ops are async, .cpu() would block anyway
+        if self.device.type == 'mps':
+            torch.mps.synchronize()
+        t_model = time.monotonic()
+
+        res_alpha = out['alpha'][0].permute(1, 2, 0).float().cpu().numpy()
+        res_fg = out['fg'][0].permute(1, 2, 0).float().cpu().numpy()
+        t_to_cpu = time.monotonic()
+
+        # Stack and resize together for speed (~8% faster than separate resizes)
+        stacked = np.concatenate([res_alpha, res_fg], axis=-1)  # [H, W, 4]
+        stacked_resized = cv2.resize(stacked, (w, h), interpolation=cv2.INTER_LANCZOS4)
+        res_alpha = stacked_resized[:, :, :1]
+        res_fg = stacked_resized[:, :, 1:4]
+        t_resize = time.monotonic()
+
+        if res_alpha.ndim == 2:
+            res_alpha = res_alpha[:, :, np.newaxis]
+
+        logger.info(
+            "predict_raw %dx%d→%d: prep=%.0fms to_gpu=%.0fms model=%.0fms to_cpu=%.0fms resize=%.0fms total=%.0fms",
+            w, h, self.img_size,
+            (t_prep - t0) * 1000, (t_to_device - t_prep) * 1000,
+            (t_model - t_to_device) * 1000, (t_to_cpu - t_model) * 1000,
+            (t_resize - t_to_cpu) * 1000, (t_resize - t0) * 1000,
+        )
+
+        # Free GPU tensors promptly
+        del inp_t, out
+        if self.device.type == 'mps':
+            torch.mps.empty_cache()
+
+        return {'alpha': res_alpha, 'fg': res_fg}
+
+    @torch.no_grad()
+    def predict_raw_batch(self, images, masks, refiner_scale=1.0, input_is_linear=False):
+        """Process multiple crops through the model sequentially.
+
+        The Hiera encoder uses .view() internally which requires batch=1.
+        This method pre-computes all input tensors on CPU, then runs them
+        through the GPU one at a time with minimal Python overhead between
+        calls, and batches the resize-back on CPU.
+
+        Args:
+            images: list of [H_i, W_i, 3] numpy arrays.
+            masks: list of [H_i, W_i] or [H_i, W_i, 1] numpy arrays.
+            refiner_scale: Refiner delta multiplier.
+            input_is_linear: Whether inputs are linear color.
+
+        Returns:
+            list of dicts, each with 'alpha' [H_i, W_i, 1] and 'fg' [H_i, W_i, 3].
+        """
+        n = len(images)
+        if n == 0:
+            return []
+
+        # For tile batches, determine optimal canvas size based on actual tile dimensions
+        # This makes inference fast for small tiles and good-quality for large tiles
+        orig_sizes = [(img.shape[1], img.shape[0]) for img in images]
+        max_tile_dim = max(max(h, w) for w, h in orig_sizes) if orig_sizes else 256
+        
+        # Choose canvas size proportional to max tile size
+        if self.device.type == 'mps':
+            # MPS: be conservative with memory
+            if max_tile_dim <= 128:
+                batch_img_size = 384   # 3x upscaling
+            elif max_tile_dim <= 256:
+                batch_img_size = 512   # 2x upscaling  
+            elif max_tile_dim <= 512:
+                batch_img_size = 768   # 1.5x upscaling
+            else:
+                batch_img_size = self.img_size  # Use configured size for large tiles
+        else:
+            # CUDA: use full res
+            batch_img_size = self.img_size
+        
+        logger.debug(f"predict_raw_batch: max_tile_dim={max_tile_dim}px, using img_size={batch_img_size}px for {n} tiles")
+        
+        # Temporarily override img_size for this batch
+        orig_img_size = self.img_size
+        self.img_size = batch_img_size
+
+        # Pre-compute all input tensors on CPU (numpy ops, no GPU wait)
+        input_tensors = []
+        for img, msk in zip(images, masks):
+            inp_np = self._prepare_input(img, msk, input_is_linear)
+            inp_t = torch.from_numpy(inp_np.transpose((2, 0, 1))).float().unsqueeze(0)
+            input_tensors.append(inp_t)
+
+        # Run each tile through GPU sequentially (model requires batch=1)
+        t_batch_start = time.monotonic()
+        refiner_scale_val = refiner_scale
+        raw_alphas = []
+        raw_fgs = []
+        for tile_i, inp_t in enumerate(input_tensors):
+            t_tile = time.monotonic()
+            inp_t = inp_t.to(self.device)
+            rs_t = inp_t.new_tensor(refiner_scale_val)
+            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+                out = self.model(inp_t, refiner_scale=rs_t)
+            if self.device.type == 'mps':
+                torch.mps.synchronize()
+            raw_alphas.append(out['alpha'][0].float().cpu())
+            raw_fgs.append(out['fg'][0].float().cpu())
+            del inp_t, out
+            logger.debug("  tile %d/%d: %.0fms", tile_i + 1, n, (time.monotonic() - t_tile) * 1000)
+
+        if self.device.type == 'mps':
+            torch.mps.empty_cache()
+
+        # Resize all results back on CPU (stack then resize for speed)
+        results = []
+        for i in range(n):
+            w, h = orig_sizes[i]
+            alpha_np = raw_alphas[i].permute(1, 2, 0).contiguous().numpy()
+            fg_np = raw_fgs[i].permute(1, 2, 0).contiguous().numpy()
+            # Stack and resize together (~8% faster)
+            stacked = np.concatenate([alpha_np, fg_np], axis=-1)  # [H, W, 4]
+            stacked_resized = cv2.resize(stacked, (w, h), interpolation=cv2.INTER_LANCZOS4)
+            alpha_np = stacked_resized[:, :, :1]
+            fg_np = stacked_resized[:, :, 1:4]
+            if alpha_np.ndim == 2:
+                alpha_np = alpha_np[:, :, np.newaxis]
+            results.append({'alpha': alpha_np, 'fg': fg_np})
+
+        # Restore original img_size
+        self.img_size = orig_img_size
+        
+        logger.info("predict_raw_batch: %d tiles in %.0fms", n, (time.monotonic() - t_batch_start) * 1000)
+        return results
+
+    @staticmethod
+    def finalize_outputs(res_alpha, res_fg, fg_is_straight=True, despill_strength=1.0,
+                         auto_despeckle=True, despeckle_size=400, despeckle_dilation=25,
+                         despeckle_blur=5, comp_enabled=True, processed_enabled=True):
+        """Post-process stitched raw alpha/fg into final outputs.
+
+        This is CPU-only (numpy/OpenCV) and should be called once on the
+        full stitched frame, not per-tile.
+
+        Args:
+            res_alpha: [H, W, 1] float32 raw alpha prediction.
+            res_fg: [H, W, 3] float32 sRGB raw foreground prediction.
+            fg_is_straight: True if FG is straight (unpremultiplied).
+            despill_strength: 0.0-1.0 despill multiplier.
+            auto_despeckle: Clean up small disconnected alpha islands.
+            despeckle_size: Min pixel area to keep.
+            despeckle_dilation: Dilation radius for clean_matte.
+            despeckle_blur: Blur kernel half-size for clean_matte.
+            comp_enabled: If False, skip checkerboard/composite (comp=None).
+            processed_enabled: If False, skip premultiply/RGBA concat (processed=None).
+
+        Returns:
+            dict with 'alpha', 'fg', 'comp', 'processed'.
+        """
+        t_total = time.monotonic()
+        h, w = res_alpha.shape[:2]
+
+        # --- clean matte ---
+        t0 = time.monotonic()
+        if auto_despeckle:
+            processed_alpha = cu.clean_matte(res_alpha, area_threshold=despeckle_size,
+                                             dilation=despeckle_dilation, blur_size=despeckle_blur)
+        else:
+            processed_alpha = res_alpha
+        dt_matte = time.monotonic() - t0
+
+        # --- despill ---
+        t0 = time.monotonic()
+        if despill_strength > 0.0:
+            fg_despilled = cu.despill(res_fg, green_limit_mode='average', strength=despill_strength)
+        else:
+            fg_despilled = res_fg
+        dt_despill = time.monotonic() - t0
+
+        # --- srgb_to_linear (only needed for comp or processed) ---
+        dt_color = 0.0
+        fg_despilled_lin = None
+        if comp_enabled or processed_enabled:
+            t0 = time.monotonic()
+            fg_despilled_lin = cu.srgb_to_linear(fg_despilled)
+            dt_color = time.monotonic() - t0
+
+        # --- premultiply + RGBA concat (only for processed) ---
+        dt_premul = 0.0
+        processed_rgba = None
+        if processed_enabled:
+            t0 = time.monotonic()
+            fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
+            processed_rgba = np.concatenate([fg_premul_lin, processed_alpha], axis=-1)
+            dt_premul = time.monotonic() - t0
+
+        # --- composite (only for comp) ---
+        dt_comp = 0.0
+        comp_srgb = None
+        if comp_enabled:
+            t0 = time.monotonic()
+            key = (w, h)
+            bg_lin = _bg_lin_cache.get(key)
+            if bg_lin is None:
+                bg_srgb = cu.create_checkerboard(w, h, checker_size=128, color1=0.15, color2=0.55)
+                bg_lin = cu.srgb_to_linear(bg_srgb)
+                _bg_lin_cache[key] = bg_lin
+
+            if fg_is_straight:
+                comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha)
+            else:
+                comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
+
+            comp_srgb = cu.linear_to_srgb(comp_lin)
+            dt_comp = time.monotonic() - t0
+
+        dt_total = time.monotonic() - t_total
+        logger.debug(
+            "finalize %dx%d: matte=%.0fms despill=%.0fms color=%.0fms premul=%.0fms comp=%.0fms total=%.0fms",
+            w, h,
+            dt_matte * 1000, dt_despill * 1000, dt_color * 1000,
+            dt_premul * 1000, dt_comp * 1000, dt_total * 1000,
+        )
+
+        return {
+            'alpha': res_alpha,
+            'fg': res_fg,
+            'comp': comp_srgb,
+            'processed': processed_rgba,
+        }
+
+    @torch.no_grad()
+    def process_frame(self, image, mask_linear, refiner_scale=1.0, input_is_linear=False, fg_is_straight=True, despill_strength=1.0, auto_despeckle=True, despeckle_size=400, despeckle_dilation=25, despeckle_blur=5, comp_enabled=True, processed_enabled=True):
+        """
+        Process a single frame (full pipeline: predict + finalize).
         Args:
             image: Numpy array [H, W, 3] (0.0-1.0 or 0-255).
                    - If input_is_linear=False (Default): Assumed sRGB.
@@ -422,102 +643,22 @@ class CorridorKeyEngine:
         """
         t0 = time.monotonic()
 
-        # 1. Inputs Check & Normalization
-        if image.dtype == np.uint8:
-            image = image.astype(np.float32) / 255.0
-            
-        if mask_linear.dtype == np.uint8:
-            mask_linear = mask_linear.astype(np.float32) / 255.0
-            
-        h, w = image.shape[:2]
-        
-        # Ensure Mask Shape
-        if mask_linear.ndim == 2:
-            mask_linear = mask_linear[:, :, np.newaxis]
-            
-        # 2. Resize to Model Size
-        # If input is linear, we resize in linear to preserve energy/highlights,
-        # THEN convert to sRGB for the model.
-        if input_is_linear:
-             # Resize in Linear
-             img_resized_lin = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-             # Convert to sRGB for Model
-             img_resized = cu.linear_to_srgb(img_resized_lin)
-        else:
-             # Standard sRGB Resize
-             img_resized = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        raw = self.predict_raw(image, mask_linear, refiner_scale=refiner_scale,
+                               input_is_linear=input_is_linear)
 
-        mask_resized = cv2.resize(mask_linear, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-        
-        if mask_resized.ndim == 2:
-            mask_resized = mask_resized[:, :, np.newaxis]
-            
-        # 3. Normalize (ImageNet)
-        # Model expects sRGB input normalized
-        img_norm = (img_resized - self.mean) / self.std
-        
-        # 4. Prepare Tensor
-        inp_np = np.concatenate([img_norm, mask_resized], axis=-1) # [H, W, 4]
-        inp_t = torch.from_numpy(inp_np.transpose((2, 0, 1))).float().unsqueeze(0).to(self.device)
-        
-        # 5. Inference
-        refiner_scale_t = inp_t.new_tensor(refiner_scale)
-        with torch.autocast(device_type=self.device.type, dtype=torch.float16):
-            out = self._forward_model(inp_t, refiner_scale_t)
-            
-        pred_alpha = out['alpha']
-        pred_fg = out['fg'] # Output is sRGB (Sigmoid)
-        
-        # 6. Post-Process (Resize Back to Original Resolution)
-        # We use Lanczos4 for high-quality resampling to minimize blur when going back to 4K/Original.
-        res_alpha = pred_alpha[0].permute(1, 2, 0).float().cpu().numpy()
-        res_fg = pred_fg[0].permute(1, 2, 0).float().cpu().numpy()
-        res_alpha = cv2.resize(res_alpha, (w, h), interpolation=cv2.INTER_LANCZOS4)
-        res_fg = cv2.resize(res_fg, (w, h), interpolation=cv2.INTER_LANCZOS4)
-        
-        if res_alpha.ndim == 2: res_alpha = res_alpha[:, :, np.newaxis]
+        result = self.finalize_outputs(
+            raw['alpha'], raw['fg'],
+            fg_is_straight=fg_is_straight,
+            despill_strength=despill_strength,
+            auto_despeckle=auto_despeckle,
+            despeckle_size=despeckle_size,
+            despeckle_dilation=despeckle_dilation,
+            despeckle_blur=despeckle_blur,
+            comp_enabled=comp_enabled,
+            processed_enabled=processed_enabled,
+        )
 
-        # --- ADVANCED COMPOSITING ---
-        
-        # A. Clean Matte (Auto-Despeckle)
-        if auto_despeckle:
-            processed_alpha = cu.clean_matte(res_alpha, area_threshold=despeckle_size, dilation=despeckle_dilation, blur_size=despeckle_blur)
-        else:
-            processed_alpha = res_alpha
-            
-        # B. Despill FG
-        # res_fg is sRGB.
-        fg_despilled = cu.despill(res_fg, green_limit_mode='average', strength=despill_strength)
-        
-        # C. Premultiply (for EXR Output)
-        # CONVERT TO LINEAR FIRST! EXRs must house linear color premultiplied by linear alpha.
-        fg_despilled_lin = cu.srgb_to_linear(fg_despilled)
-        fg_premul_lin = cu.premultiply(fg_despilled_lin, processed_alpha)
-        
-        # D. Pack RGBA
-        # [H, W, 4] - All channels are now strictly Linear Float
-        processed_rgba = np.concatenate([fg_premul_lin, processed_alpha], axis=-1)
-
-        # ----------------------------
-        
-        # 7. Composite (on Checkerboard) for checking
-        # Generate Dark/Light Gray Checkerboard (in sRGB, convert to Linear)
-        bg_srgb = cu.create_checkerboard(w, h, checker_size=128, color1=0.15, color2=0.55)
-        bg_lin = cu.srgb_to_linear(bg_srgb)
-        
-        if fg_is_straight:
-             comp_lin = cu.composite_straight(fg_despilled_lin, bg_lin, processed_alpha) 
-        else:
-             # If premultiplied model, we shouldn't multiply again (though our pipeline forces straight)
-             comp_lin = cu.composite_premul(fg_despilled_lin, bg_lin, processed_alpha)
-             
-        comp_srgb = cu.linear_to_srgb(comp_lin)
-        
+        h, w = raw['alpha'].shape[:2]
         logger.debug(f"process_frame: {h}x{w} in {time.monotonic() - t0:.3f}s")
 
-        return {
-            'alpha': res_alpha,        # Linear, Raw Prediction
-            'fg': res_fg,              # sRGB, Raw Prediction (Straight)
-            'comp': comp_srgb,         # sRGB, Composite
-            'processed': processed_rgba # Linear/Premul, RGBA, Garbage Matted & Despilled
-        }
+        return result

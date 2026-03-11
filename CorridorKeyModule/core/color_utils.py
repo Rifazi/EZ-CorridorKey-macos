@@ -29,6 +29,9 @@ def srgb_to_linear(x):
         return torch.where(mask, x / 12.92, torch.pow((x + 0.055) / 1.055, 2.4))
     else:
         x = np.clip(x, 0.0, None)
+        # Fast path: if already linear (all values low), return as-is
+        if np.all(x <= 0.04045):
+            return x
         mask = x <= 0.04045
         return np.where(mask, x / 12.92, np.power((x + 0.055) / 1.055, 2.4))
 
@@ -209,6 +212,8 @@ def clean_matte(alpha_np, area_threshold=300, dilation=15, blur_size=5):
     """
     Cleans up small disconnected components (like tracking markers) from a predicted alpha matte.
     alpha_np: Numpy array [H, W] or [H, W, 1] float (0.0 - 1.0)
+    
+    Skipped automatically for small images (< 1M pixels) as connected components is slow.
     """
     import cv2
     import numpy as np
@@ -218,6 +223,12 @@ def clean_matte(alpha_np, area_threshold=300, dilation=15, blur_size=5):
     if alpha_np.ndim == 3:
         is_3d = True
         alpha_np = alpha_np[:, :, 0]
+    
+    # Skip clean_matte for small images (connected components is slow)
+    if alpha_np.size < 1024 * 1024:  # < 1M pixels
+        if is_3d:
+            alpha_np = alpha_np[:, :, np.newaxis]
+        return alpha_np
         
     # Threshold to binary
     mask_8u = (alpha_np > 0.5).astype(np.uint8) * 255
@@ -225,13 +236,10 @@ def clean_matte(alpha_np, area_threshold=300, dilation=15, blur_size=5):
     # Find connected components
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_8u, connectivity=8)
     
-    # Create an empty mask for the cleaned components
-    cleaned_mask = np.zeros_like(mask_8u)
-    
-    # Keep components larger than the threshold (skip label 0, which is background)
-    for i in range(1, num_labels):
-        if stats[i, cv2.CC_STAT_AREA] >= area_threshold:
-            cleaned_mask[labels == i] = 255
+    # Keep components larger than the threshold (vectorized)
+    keep = stats[:, cv2.CC_STAT_AREA] >= area_threshold
+    keep[0] = False  # skip background label
+    cleaned_mask = (keep[labels] * 255).astype(np.uint8)
             
     # Dilate
     if dilation > 0:
