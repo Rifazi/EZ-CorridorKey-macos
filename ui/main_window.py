@@ -846,8 +846,9 @@ class MainWindow(QMainWindow):
         # Queue panel cancel signals
         self._queue_panel.cancel_job_requested.connect(self._on_cancel_job)
 
-        # Parameter panel — wire GVM / Track Mask / VideoMaMa
+        # Parameter panel — wire GVM / Rembg / Track Mask / VideoMaMa
         self._param_panel.gvm_requested.connect(self._on_run_gvm)
+        self._param_panel.rembg_requested.connect(self._on_run_rembg)
         self._param_panel.videomama_requested.connect(self._on_run_videomama)
         self._param_panel.export_masks_requested.connect(self._on_track_masks)
         self._param_panel.import_alpha_requested.connect(self._on_import_alpha)
@@ -968,11 +969,12 @@ class MainWindow(QMainWindow):
             needs_extraction=needs_extraction,
         )
 
-        # Enable GVM/VideoMaMa/Import Alpha buttons based on state
+        # Enable GVM/VideoMaMa/Rembg/Import Alpha buttons based on state
         self._param_panel.set_gvm_enabled(clip.state == ClipState.RAW)
         self._param_panel.set_videomama_enabled(
             self._clip_has_videomama_ready_mask(clip)
         )
+        self._param_panel.set_rembg_enabled(clip.state == ClipState.RAW)
         self._param_panel.set_import_alpha_enabled(
             clip.state in (ClipState.RAW, ClipState.MASKED, ClipState.READY)
         )
@@ -2109,6 +2111,19 @@ class MainWindow(QMainWindow):
         self._current_clip.set_processing(True)
         self._start_worker_if_needed(job.id, job_label="VideoMaMa")
 
+    @Slot()
+    def _on_run_rembg(self) -> None:
+        """Run Rembg fast background removal on the selected clip."""
+        if self._current_clip is None or self._current_clip.state != ClipState.RAW:
+            return
+
+        job = create_job_snapshot(self._current_clip, job_type=JobType.REMBG_ALPHA)
+        if not self._service.job_queue.submit(job):
+            return
+
+        self._current_clip.set_processing(True)
+        self._start_worker_if_needed(job.id, job_label="Rembg")
+
     def _start_worker_if_needed(
         self,
         first_job_id: str | None = None,
@@ -2335,6 +2350,7 @@ class MainWindow(QMainWindow):
             self._param_panel.set_videomama_enabled(
                 self._clip_has_videomama_ready_mask(self._current_clip)
             )
+            self._param_panel.set_rembg_enabled(self._current_clip.state == ClipState.RAW)
             self._param_panel.set_import_alpha_enabled(
                 self._current_clip.state in (ClipState.RAW, ClipState.MASKED, ClipState.READY)
             )

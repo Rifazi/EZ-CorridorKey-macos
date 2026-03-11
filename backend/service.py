@@ -1303,8 +1303,14 @@ class CorridorKeyService:
             raise CorridorKeyError("rembg not installed. Run: pip install rembg")
 
         try:
-            model_name = os.environ.get("CK_REMBG_MODEL", "u2netp").strip() or "u2netp"
-            session = new_session(model_name=model_name)
+            # Use faster model by default on first run; u2netp is more accurate but heavier
+            model_name = os.environ.get("CK_REMBG_MODEL", "isnet-general-use").strip() or "isnet-general-use"
+            _status(f"Initializing {model_name} session (downloading model if needed, ~50-80MB)...")
+            import sys
+            sys.stderr.flush()
+            sys.stdout.flush()
+            session = new_session(model_name=model_name, providers=["CPUExecutionProvider"])
+            _status(f"{model_name} session ready")
         except Exception as e:
             raise CorridorKeyError(f"rembg model load failed: {e}")
 
@@ -1319,7 +1325,8 @@ class CorridorKeyService:
                 result = (np.clip(result, 0.0, 1.0) * 255.0).astype(np.uint8)
             return result
 
-        mask_dir = clip.get_or_create_asset_dir('masks')
+        alpha_dir = os.path.join(clip.root_path, "AlphaHint")
+        os.makedirs(alpha_dir, exist_ok=True)
         _status("Processing frames...")
 
         input_asset = clip.input_asset
@@ -1395,39 +1402,39 @@ class CorridorKeyService:
             prev_frame_rgb = frame_rgb
             prev_mask = mask
 
-            # Async write
+            # Async write to AlphaHint
             _mask_copy = mask.copy()
             _i = i
             fut = write_pool.submit(
-                cv2.imwrite, os.path.join(mask_dir, f"mask_{_i:06d}.png"), _mask_copy,
+                cv2.imwrite, os.path.join(alpha_dir, f"{_i:06d}.png"), _mask_copy,
             )
             write_futures.append(fut)
 
             if on_progress:
-                on_progress("rembg", i + 1, total_frames)
+                on_progress(clip.name, i + 1, total_frames)
 
         # Wait for writes
         for fut in write_futures:
             try:
                 fut.result()
             except Exception as e:
-                logger.warning(f"Async mask write error: {e}")
+                logger.warning(f"Async alpha write error: {e}")
         write_pool.shutdown(wait=True)
 
         if reused_count > 0 or partial_count > 0:
             logger.info(f"Rembg [{clip.name}]: reused={reused_count} partial={partial_count} "
                         f"full={total_frames - reused_count - partial_count}")
 
-        # Create mask asset
-        mask_asset = ClipAsset(
+        # Create alpha asset
+        alpha_asset = ClipAsset(
             asset_type='image_sequence',
-            path=mask_dir,
+            path=alpha_dir,
             frame_count=total_frames,
             fps=input_asset.fps,
             width=frames[0].shape[1] if frames else 0,
             height=frames[0].shape[0] if frames else 0,
         )
-        clip.mask_asset = mask_asset
+        clip.alpha_asset = alpha_asset
 
         # Write manifest
         try:
@@ -1443,4 +1450,4 @@ class CorridorKeyService:
             if on_warning:
                 on_warning(f"State transition after rembg: {e}")
 
-        logger.info(f"Rembg complete for '{clip.name}': {total_frames} masks in {time.monotonic() - t_start:.1f}s")
+        logger.info(f"Rembg complete for '{clip.name}': {total_frames} frames in {time.monotonic() - t_start:.1f}s")
