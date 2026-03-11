@@ -849,7 +849,7 @@ class MainWindow(QMainWindow):
         # Parameter panel — wire GVM / Track Mask / VideoMaMa
         self._param_panel.gvm_requested.connect(self._on_run_gvm)
         self._param_panel.videomama_requested.connect(self._on_run_videomama)
-        self._param_panel.track_masks_requested.connect(self._on_track_masks)
+        self._param_panel.export_masks_requested.connect(self._on_track_masks)
         self._param_panel.import_alpha_requested.connect(self._on_import_alpha)
 
         # Annotation stroke finished → update annotation counter + auto-save
@@ -2953,7 +2953,8 @@ class MainWindow(QMainWindow):
     def _apply_tracker_model_setting(self) -> None:
         """Apply saved SAM2 tracker model preference to the backend service."""
         model_id = get_setting_str(KEY_TRACKER_MODEL, DEFAULT_TRACKER_MODEL)
-        self._service.set_sam2_model(model_id)
+        # TODO: Implement set_sam2_model method in backend service
+        # self._service.set_sam2_model(model_id)
 
     def _show_report_issue(self) -> None:
         import logging as _logging

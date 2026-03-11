@@ -914,8 +914,8 @@ def build_exr_vf(video_info: dict) -> str:
     )
 
     return (
-        f"scale=in_color_matrix={cs}:in_primaries={cp}:"
-        f"in_transfer={ct}:in_range={cr},format=gbrpf32le"
+        f"scale=in_color_matrix={cs},"
+        f"format=gbrpf32le"
     )
 
 
