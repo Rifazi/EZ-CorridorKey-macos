@@ -1426,14 +1426,27 @@ class CorridorKeyService:
                         f"full={total_frames - reused_count - partial_count}")
 
         # Create alpha asset
+        # Get fps from video asset if available, otherwise default to 24
+        fps = 24.0
+        if input_asset.asset_type == 'video':
+            try:
+                import cv2
+                cap = cv2.VideoCapture(input_asset.path)
+                if cap.isOpened():
+                    fps = cap.get(cv2.CAP_PROP_FPS)
+                cap.release()
+            except Exception:
+                fps = 24.0
+        
         alpha_asset = ClipAsset(
             asset_type='image_sequence',
             path=alpha_dir,
             frame_count=total_frames,
-            fps=input_asset.fps,
             width=frames[0].shape[1] if frames else 0,
             height=frames[0].shape[0] if frames else 0,
         )
+        # Add fps attribute to the alpha_asset if needed
+        alpha_asset.fps = fps
         clip.alpha_asset = alpha_asset
 
         # Write manifest
